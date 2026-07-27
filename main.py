@@ -71,6 +71,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        '--ignore-server', dest='ignored_servers', action='append',
+        metavar='[REGION/]SERVER',
+        help=(
+            'Server name or ID to never start automatically. Prefix with '
+            'REGION/, e.g. ru-7/staging-db, to limit to a region. Repeat to '
+            'ignore multiple servers (env: SELECTEL_IGNORED_SERVERS)'
+        ),
+    )
+    parser.add_argument(
         '--metric-update-interval', type=int,
         default=int(os.getenv('METRIC_UPDATE_INTERVAL', 10)),
         help=(
@@ -92,6 +101,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         env_regions = os.getenv('SELECTEL_REGIONS', 'ru-7')
         args.regions = [r.strip() for r in env_regions.split(',') if r.strip()]
 
+    if not args.ignored_servers:
+        env_ignored = os.getenv('SELECTEL_IGNORED_SERVERS', '')
+        args.ignored_servers = [
+            s.strip() for s in env_ignored.split(',') if s.strip()
+        ]
+
     required = {
         '--account / SELECTEL_ACCOUNT': args.account,
         '--project / SELECTEL_PROJECT': args.project,
@@ -112,6 +127,27 @@ def configure_logging(level_name: str) -> logging.Logger:
         format='%(asctime)s[%(levelname)s]: %(message)s',
     )
     return logging.getLogger(__name__)
+
+
+def parse_ignore_list(entries: list[str]) -> set[tuple[str | None, str]]:
+    """Parse ignore-list entries into (region, name-or-ID) pairs.
+
+    A bare entry matches any region; `region/name` scopes it to one,
+    split on the first '/' only.
+    """
+    parsed = set()
+    for entry in entries:
+        region, separator, server = entry.partition('/')
+        if not separator:
+            parsed.add((None, entry))
+            continue
+        if not region or not server:
+            raise ValueError(
+                f'malformed ignore entry {entry!r}, '
+                'expected SERVER or REGION/SERVER',
+            )
+        parsed.add((region, server))
+    return parsed
 
 
 class SelectelClient:
@@ -202,8 +238,8 @@ class SelectelClient:
         ]
 
     def get_servers(self) -> list[dict]:
-        """Return id/name/status/region for every server, all regions
-        polled concurrently."""
+        """Return id/name/status/region for every server, regions polled
+        concurrently."""
         with ThreadPoolExecutor(max_workers=len(self.regions)) as pool:
             per_region = pool.map(self._get_region_servers, self.regions)
         all_servers = [server for servers in per_region for server in servers]
@@ -220,18 +256,34 @@ class SelectelClient:
         response.raise_for_status()
 
 
+def is_ignored(server: dict, ignored: set[tuple[str | None, str]]) -> bool:
+    """Whether the server matches an ignore-list entry, by name or ID."""
+    return bool(ignored & {
+        (scope, key)
+        for scope in (None, server.get('region'))
+        for key in (server.get('name'), server.get('id'))
+    })
+
+
 def start_frozen_servers(
     client: SelectelClient,
     servers: list[dict],
+    ignored: set[tuple[str | None, str]],
     logger: logging.Logger,
 ) -> None:
-    """Start every server in SERVER_FROZEN_STATUS; pause if any started."""
+    """Start every frozen server not in `ignored`; pause if any started."""
     started_any = False
     for server in servers:
         if server.get('status') != SERVER_FROZEN_STATUS:
             continue
         server_name = server.get('name', 'unknown')
         region = server.get('region')
+        if is_ignored(server, ignored):
+            logger.info(
+                'Server %s (%s) is frozen but ignored, leaving it as is',
+                server_name, region,
+            )
+            continue
         logger.warning(
             'Server %s (%s) is frozen, trying to start it',
             server_name, region,
@@ -249,25 +301,45 @@ def start_frozen_servers(
         time.sleep(SERVER_START_PAUSE)
 
 
-def export_metrics(gauge: Gauge, servers: list[dict]) -> None:
-    """Publish server statuses as a gauge (1 = running, 0 = frozen)."""
-    gauge.clear()
+def export_metrics(
+    up_gauge: Gauge,
+    ignored_gauge: Gauge,
+    servers: list[dict],
+    ignored: set[tuple[str | None, str]],
+) -> None:
+    """Publish server statuses (1 = running, 0 = frozen) and whether each
+    is in `ignored` (1 = ignored)."""
+    up_gauge.clear()
+    ignored_gauge.clear()
     for server in servers:
         server_name = server.get('name', 'unknown')
+        server_id = server.get('id', 'unknown')
         region = server.get('region', 'unknown')
         is_frozen = server.get('status') == SERVER_FROZEN_STATUS
-        gauge.labels(server_name, region).set(0 if is_frozen else 1)
+        up_gauge.labels(server_name, server_id, region).set(
+            0 if is_frozen else 1,
+        )
+        ignored_gauge.labels(server_name, server_id, region).set(
+            1 if is_ignored(server, ignored) else 0,
+        )
 
 
 def main() -> None:
     """Start the metrics HTTP server and continuously poll/repair servers."""
     args = parse_args()
     logger = configure_logging(args.log_level)
+    ignored = parse_ignore_list(args.ignored_servers)
 
     server_up = Gauge(
         'selectel_server_up',
         'Selectel server status (1 = running, 0 = frozen)',
-        ['server_name', 'region'],
+        ['server_name', 'server_id', 'region'],
+    )
+    server_ignored = Gauge(
+        'selectel_server_ignored',
+        'Whether the server is excluded from automatic start '
+        '(1 = ignored, 0 = managed)',
+        ['server_name', 'server_id', 'region'],
     )
     client = SelectelClient(
         account=args.account,
@@ -281,6 +353,17 @@ def main() -> None:
     start_http_server(args.port, addr=args.host)
     logger.info('App started on %s:%s', args.host, args.port)
     logger.info('Regions: %s', ', '.join(args.regions))
+    if args.ignored_servers:
+        logger.info('Ignored servers: %s', ', '.join(args.ignored_servers))
+        stray = sorted({
+            region for region, _ in ignored
+            if region is not None and region not in args.regions
+        })
+        if stray:
+            logger.warning(
+                'Ignore list scopes servers to unmonitored region(s): %s; '
+                'those entries will never match', ', '.join(stray),
+            )
     logger.info(
         'Metric update interval: %s seconds', args.metric_update_interval,
     )
@@ -294,8 +377,8 @@ def main() -> None:
             time.sleep(args.metric_update_interval)
             continue
 
-        export_metrics(server_up, servers)
-        start_frozen_servers(client, servers, logger)
+        export_metrics(server_up, server_ignored, servers, ignored)
+        start_frozen_servers(client, servers, ignored, logger)
         time.sleep(args.metric_update_interval)
 
 

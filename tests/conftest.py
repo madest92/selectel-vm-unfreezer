@@ -27,6 +27,16 @@ def registry():
 @pytest.fixture
 def gauge(registry):
     return Gauge(
-        'selectel_server_up', 'test gauge', ['server_name', 'region'],
+        'selectel_server_up', 'test gauge',
+        ['server_name', 'server_id', 'region'],
+        registry=registry,
+    )
+
+
+@pytest.fixture
+def ignored_gauge(registry):
+    return Gauge(
+        'selectel_server_ignored', 'test gauge',
+        ['server_name', 'server_id', 'region'],
         registry=registry,
     )
