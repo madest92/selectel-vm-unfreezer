@@ -348,28 +348,67 @@ class Unfreezer:
         self.metrics = metrics
         self.ignore_list = ignore_list
         self.logger = logger
+        # (region, id) -> last state logged, so a server that stays frozen
+        # is reported once instead of every cycle
+        self._reported: dict[tuple[str, str], str] = {}
 
-    def start_frozen(self, servers: list[Server]) -> int:
+    def _report(
+        self,
+        server: Server,
+        state: str,
+        level: int,
+        message: str,
+        *args,
+        transition_only: bool = False,
+    ) -> None:
+        """Log only when the server's state differs from the last cycle."""
+        key = (server.region, server.id)
+        previous = self._reported.get(key)
+        self._reported[key] = state
+        if previous == state or (previous is None and transition_only):
+            return
+        self.logger.log(level, message, server, *args)
+
+    def _forget_gone(self, poll: Poll) -> None:
+        """Drop servers that are gone, but only from regions that answered:
+        an unreachable region must not look like a deletion."""
+        answered = {r for r, ok in poll.regions.items() if ok}
+        alive = {(s.region, s.id) for s in poll.servers}
+        self._reported = {
+            key: state for key, state in self._reported.items()
+            if key[0] not in answered or key in alive
+        }
+
+    def start_frozen(self, poll: Poll) -> int:
         """Start every frozen server not ignored; return how many."""
         started = 0
-        for server in servers:
+        for server in poll.servers:
             if not server.is_frozen:
-                continue
-            if self.ignore_list.matches(server):
-                self.logger.info(
-                    'Server %s is frozen but ignored, leaving it as is',
-                    server,
+                self._report(
+                    server, 'running', logging.INFO,
+                    'Server %s is running again', transition_only=True,
                 )
                 continue
-            self.logger.warning(
-                'Server %s is frozen, trying to start it', server,
-            )
+            if self.ignore_list.matches(server):
+                self._report(
+                    server, 'ignored', logging.WARNING,
+                    'Server %s is frozen, but ignored',
+                )
+                continue
             try:
                 self.client.start_server(server)
             except Exception as e:
-                self.logger.error('Failed to start server %s: %s', server, e)
+                self._report(
+                    server, f'failed: {e}', logging.ERROR,
+                    'Failed to start server %s: %s', e,
+                )
                 continue
             started += 1
+            self._report(
+                server, 'starting', logging.WARNING,
+                'Server %s is frozen, starting it',
+            )
+        self._forget_gone(poll)
         return started
 
     def poll_once(self) -> None:
@@ -382,7 +421,7 @@ class Unfreezer:
             return
 
         self.metrics.export(poll, self.ignore_list)
-        if self.start_frozen(poll.servers):
+        if self.start_frozen(poll):
             time.sleep(SERVER_START_PAUSE)
 
     def run_forever(self, interval: int) -> None:

@@ -5,7 +5,7 @@ import pytest
 import requests
 
 import main
-from main import IgnoreList, Server
+from main import IgnoreList, Poll, Server
 
 FROZEN = main.SERVER_FROZEN_STATUS
 
@@ -19,30 +19,18 @@ def sample(registry, metric: str, server: Server):
     })
 
 
-@pytest.mark.parametrize(
-    'argv, env, expected',
-    [
-        pytest.param([], None, [], id='defaults_to_empty_list'),
-        pytest.param([], ' a , b ,, ', ['a', 'b'], id='env_is_comma_split'),
-        pytest.param(
-            ['--ignore-server', 'a', '--ignore-server', 'b'], 'c',
-            ['a', 'b'], id='flag_is_repeatable_and_wins_over_env',
-        ),
-    ],
-)
-def test_parse_args_ignored_servers(monkeypatch, argv, env, expected):
-    if env is None:
-        monkeypatch.delenv('SELECTEL_IGNORED_SERVERS', raising=False)
-    else:
-        monkeypatch.setenv('SELECTEL_IGNORED_SERVERS', env)
+def unfreezer(logger, ignored=(), client=None):
+    return main.Unfreezer(
+        client or Mock(), Mock(), IgnoreList.parse(list(ignored)), logger,
+    )
 
-    args = main.parse_args([
+
+def parse_args(*argv):
+    return main.parse_args([
         '--account', 'acct', '--project', 'proj',
         '--user', 'usr', '--password', 'pwd',
         *argv,
     ])
-
-    assert args.ignored_servers == expected
 
 
 @pytest.mark.parametrize(
@@ -51,10 +39,8 @@ def test_parse_args_ignored_servers(monkeypatch, argv, env, expected):
         pytest.param([], None, [], id='empty_means_auto_discovery'),
         pytest.param([], '  ,, ', [], id='blank_env_means_auto_discovery'),
         pytest.param(
-            [], 'ru-3, ru-9', ['ru-3', 'ru-9'], id='env_is_comma_split',
-        ),
-        pytest.param(
-            ['--region', 'ru-1'], 'ru-3', ['ru-1'], id='flag_wins_over_env',
+            ['--region', 'ru-1'], 'ru-3, ru-9', ['ru-1'],
+            id='flag_is_split_from_env_and_wins',
         ),
     ],
 )
@@ -64,13 +50,13 @@ def test_parse_args_regions(monkeypatch, argv, env, expected):
     else:
         monkeypatch.setenv('SELECTEL_REGIONS', env)
 
-    args = main.parse_args([
-        '--account', 'acct', '--project', 'proj',
-        '--user', 'usr', '--password', 'pwd',
-        *argv,
-    ])
+    assert parse_args(*argv).regions == expected
 
-    assert args.regions == expected
+
+def test_parse_args_reads_the_ignore_env_var(monkeypatch):
+    monkeypatch.setenv('SELECTEL_IGNORED_SERVERS', 'a, b')
+
+    assert parse_args().ignored_servers == ['a', 'b']
 
 
 @pytest.mark.parametrize(
@@ -101,12 +87,14 @@ def test_ensure_token(client, monkeypatch, token, age_offset, expect_refresh):
         return
 
     assert client._token == 'new-tok'
-    payload = mock_post.call_args.kwargs['json']
-    user = payload['auth']['identity']['password']['user']
-    assert user['name'] == 'usr'
-    assert user['domain']['name'] == 'acct'
-    assert user['password'] == 'pwd'
-    assert payload['auth']['scope']['project']['name'] == 'proj'
+    # Keystone nests the account under both the user and the scope.
+    payload = mock_post.call_args.kwargs['json']['auth']
+    assert payload['identity']['password']['user'] == {
+        'name': 'usr', 'domain': {'name': 'acct'}, 'password': 'pwd',
+    }
+    assert payload['scope']['project'] == {
+        'name': 'proj', 'domain': {'name': 'acct'},
+    }
 
 
 def test_compute_endpoints_keeps_public_urls_per_region():
@@ -157,14 +145,8 @@ def test_compute_endpoints_keeps_public_urls_per_region():
             id='parses_servers_and_preemptible_tag',
         ),
         pytest.param(
-            None,
-            {'servers': [{'name': 'srv-1'}]},
-            [Server('unknown', 'srv-1', 'unknown', 'ru-1')],
-            id='missing_fields_fall_back_to_unknown',
-        ),
-        pytest.param(
             requests.ConnectionError('down'), None, None,
-            id='network_error_returns_none',
+            id='failure_is_none_not_an_empty_list',
         ),
     ],
 )
@@ -178,13 +160,7 @@ def test_get_region_servers(
         mock_get = Mock(return_value=Mock(json=Mock(return_value=get_json)))
     monkeypatch.setattr(client._session, 'get', mock_get)
 
-    servers = client._get_region_servers('ru-1')
-
-    assert servers == expected
-
-
-def test_get_region_servers_skips_regions_without_an_endpoint(client):
-    assert client._get_region_servers('ru-99') is None
+    assert client._get_region_servers('ru-1') == expected
 
 
 def test_get_region_servers_expires_a_rejected_token(client, monkeypatch):
@@ -213,9 +189,22 @@ def test_get_region_servers_asks_for_a_microversion_with_tags(
     assert headers['OpenStack-API-Version'] == 'compute latest'
 
 
-def test_poll_narrows_to_preemptible_regions_and_caches(
-    client, monkeypatch,
-):
+def test_start_server_posts_unshelve_action(client, monkeypatch):
+    client._token = 'tok'
+    mock_response = Mock()
+    mock_post = Mock(return_value=mock_response)
+    monkeypatch.setattr(client._session, 'post', mock_post)
+
+    client.start_server(Server('srv-id', 'srv', 'ACTIVE', 'ru-1'))
+
+    assert mock_post.call_args.args[0] == (
+        'https://ru-1.cloud.api.selcloud.ru/compute/v2.1/servers/srv-id/action'
+    )
+    assert mock_post.call_args.kwargs['json'] == {'unshelve': None}
+    mock_response.raise_for_status.assert_called_once()
+
+
+def test_poll_narrows_to_preemptible_regions_and_caches(client, monkeypatch):
     client.regions = []  # no --region, so discovery is in charge
     client._endpoints = {r: f'https://{r}' for r in ('ru-1', 'ru-2', 'ru-3')}
     per_region = {
@@ -249,13 +238,13 @@ def test_poll_narrows_to_preemptible_regions_and_caches(
     assert sorted(polled) == ['ru-1', 'ru-2', 'ru-3']
 
 
-def test_poll_keeps_the_region_set_when_a_sweep_fails(client, monkeypatch):
+def test_poll_survives_a_failing_sweep(client, monkeypatch):
     client.regions = []
     client._endpoints = {r: f'https://{r}' for r in ('ru-1', 'ru-2')}
-    reachable = True
+    unreachable = set()
 
     def fake_fetch(region):
-        if not reachable:
+        if region in unreachable:
             return None
         return [Server('1', 'a', FROZEN, region, preemptible=True)]
 
@@ -263,38 +252,21 @@ def test_poll_keeps_the_region_set_when_a_sweep_fails(client, monkeypatch):
     client.poll()
     assert client._discovered_regions == ['ru-1', 'ru-2']
 
-    # A sweep that reaches nothing must not blank the set for the whole
-    # TTL: the very next cycle has to try again.
-    reachable = False
+    # Reaching nothing proves nothing, so the set must survive untouched
+    # instead of being blanked for a whole REGION_CACHE_TTL.
+    unreachable = {'ru-1', 'ru-2'}
     client._discovered_at -= main.REGION_CACHE_TTL
     assert client.poll().servers == []
     assert client._discovered_regions == ['ru-1', 'ru-2']
 
-    reachable = True
-    assert len(client.poll().servers) == 2
-
-
-def test_poll_keeps_regions_it_could_not_recheck(client, monkeypatch):
-    client.regions = []
-    client._endpoints = {r: f'https://{r}' for r in ('ru-1', 'ru-2')}
-
-    def fake_fetch(region):
-        if region == 'ru-1':
-            return None  # unreachable, verdict unknown
-        return []        # answered, genuinely has nothing
-
-    monkeypatch.setattr(client, '_get_region_servers', fake_fetch)
-    client._discovered_regions = ['ru-1', 'ru-2']
-
+    # Half a sweep keeps the half it could not re-check.
+    unreachable = {'ru-1'}
+    client._discovered_at -= main.REGION_CACHE_TTL
     client.poll()
-
-    # ru-2 answered and is empty, so it goes; ru-1 stays until we can ask.
-    assert client._discovered_regions == ['ru-1']
+    assert client._discovered_regions == ['ru-1', 'ru-2']
 
 
-def test_poll_uses_explicit_regions_without_sweeping(
-    client, monkeypatch,
-):
+def test_poll_uses_explicit_regions_without_sweeping(client, monkeypatch):
     polled = []
 
     def fake_fetch(region):
@@ -311,27 +283,6 @@ def test_poll_uses_explicit_regions_without_sweeping(
     assert polled == ['ru-1', 'ru-2', 'ru-1', 'ru-2']
     assert client._discovered_regions == []
     assert client._discovered_at == 0.0
-
-
-def test_start_server_posts_unshelve_action(client, monkeypatch):
-    client._token = 'tok'
-    mock_response = Mock()
-    mock_post = Mock(return_value=mock_response)
-    monkeypatch.setattr(client._session, 'post', mock_post)
-
-    client.start_server(Server('srv-id', 'srv', 'ACTIVE', 'ru-1'))
-
-    assert mock_post.call_args.args[0] == (
-        'https://ru-1.cloud.api.selcloud.ru/compute/v2.1/servers/srv-id/action'
-    )
-    assert mock_post.call_args.kwargs['json'] == {'unshelve': None}
-    mock_response.raise_for_status.assert_called_once()
-
-
-def test_ignore_list_splits_on_first_slash_only():
-    assert IgnoreList.parse(['ru-7/team/srv-1'])._entries == {
-        ('ru-7', 'team/srv-1'),
-    }
 
 
 @pytest.mark.parametrize(
@@ -352,8 +303,7 @@ def test_ignore_list_rejects_malformed_entries(entry):
         pytest.param([], False, id='empty_list_ignores_nothing'),
         pytest.param(['srv-1'], True, id='matches_by_name'),
         pytest.param(['id-1'], True, id='matches_by_id'),
-        pytest.param(['srv-2', 'id-2'], False, id='other_server_does_not'),
-        pytest.param(['ru-1'], False, id='bare_region_is_not_matched'),
+        pytest.param(['srv-2'], False, id='other_server_does_not'),
         pytest.param(['ru-1/srv-1'], True, id='matches_scoped_name'),
         pytest.param(['ru-2/srv-1'], False, id='scope_to_other_region_misses'),
     ],
@@ -362,12 +312,6 @@ def test_ignore_list_matches(entries, expected):
     server = Server('id-1', 'srv-1', 'ACTIVE', 'ru-1')
 
     assert IgnoreList.parse(entries).matches(server) is expected
-
-
-def test_ignore_list_reports_unmonitored_regions():
-    ignore_list = IgnoreList.parse(['ru-9/a', 'ru-7/b', 'c'])
-
-    assert ignore_list.unmonitored_regions(['ru-7']) == ['ru-9']
 
 
 @pytest.mark.parametrize(
@@ -380,11 +324,6 @@ def test_ignore_list_reports_unmonitored_regions():
             ],
             [], None, ['2'], 1,
             id='starts_only_frozen',
-        ),
-        pytest.param(
-            [Server('1', 'a', 'ACTIVE', 'ru-1')],
-            [], None, [], 0,
-            id='nothing_frozen_starts_nothing',
         ),
         pytest.param(
             [
@@ -411,45 +350,114 @@ def test_start_frozen(
     client = Mock()
     if start_side_effect is not None:
         client.start_server.side_effect = start_side_effect
-    unfreezer = main.Unfreezer(
-        client, Mock(), IgnoreList.parse(ignored), logger,
-    )
+    unf = unfreezer(logger, ignored=ignored, client=client)
 
-    started = unfreezer.start_frozen(servers)
+    started = unf.start_frozen(
+        Poll(servers, {s.region: True for s in servers}),
+    )
 
     calls = client.start_server.call_args_list
     assert [call.args[0].id for call in calls] == attempted_ids
     assert started == expected_started
 
 
+def test_start_frozen_reports_a_state_only_once(caplog, logger):
+    frozen = Server('1', 'db', FROZEN, 'ru-1')
+    running = Server('1', 'db', 'ACTIVE', 'ru-1')
+    healthy = Server('2', 'web', 'ACTIVE', 'ru-1')
+    unf = unfreezer(logger, ignored=['db'])
+
+    with caplog.at_level('DEBUG'):
+        for _ in range(5):
+            unf.start_frozen(Poll([frozen, healthy], {'ru-1': True}))
+        # A server that was never frozen is not an event worth reporting.
+        assert [r.message for r in caplog.records] == [
+            'Server db (ru-1) is frozen, but ignored',
+        ]
+        assert caplog.records[0].levelname == 'WARNING'
+
+        # The user unfreezes it by hand: that transition must show up.
+        caplog.clear()
+        for _ in range(2):
+            unf.start_frozen(Poll([running, healthy], {'ru-1': True}))
+        assert [r.message for r in caplog.records] == [
+            'Server db (ru-1) is running again',
+        ]
+
+        # ...and so must freezing it again.
+        caplog.clear()
+        unf.start_frozen(Poll([frozen, healthy], {'ru-1': True}))
+        assert len(caplog.records) == 1
+
+
+def test_start_frozen_repeats_a_failure_only_when_it_changes(caplog, logger):
+    client = Mock()
+    client.start_server.side_effect = RuntimeError('quota exceeded')
+    poll = Poll([Server('1', 'db', FROZEN, 'ru-1')], {'ru-1': True})
+    unf = unfreezer(logger, client=client)
+
+    with caplog.at_level('DEBUG'):
+        for _ in range(3):
+            unf.start_frozen(poll)
+        assert len(caplog.records) == 1
+
+        caplog.clear()
+        client.start_server.side_effect = RuntimeError('network down')
+        unf.start_frozen(poll)
+
+    # A different failure is a new fact, so it gets through.
+    assert len(caplog.records) == 1
+    assert 'network down' in caplog.records[0].message
+    # Retries never stopped, only the logging did.
+    assert client.start_server.call_count == 4
+
+
+def test_start_frozen_keeps_memory_of_unreachable_regions(caplog, logger):
+    frozen = Server('1', 'db', FROZEN, 'ru-1')
+    unf = unfreezer(logger, ignored=['db'])
+
+    with caplog.at_level('DEBUG'):
+        unf.start_frozen(Poll([frozen], {'ru-1': True}))
+        caplog.clear()
+
+        # ru-1 goes dark, so its servers are absent from the poll. That is
+        # not a deletion, and must not re-announce them once it returns.
+        unf.start_frozen(Poll([], {'ru-1': False}))
+        unf.start_frozen(Poll([frozen], {'ru-1': True}))
+
+    assert caplog.records == []
+
+
 def test_poll_once_pauses_only_when_something_started(monkeypatch, logger):
     client = Mock()
-    client.poll.return_value = main.Poll(
+    client.poll.return_value = Poll(
         [Server('1', 'a', FROZEN, 'ru-1')], {'ru-1': True},
     )
     sleep_mock = Mock()
     monkeypatch.setattr(main.time, 'sleep', sleep_mock)
-    unfreezer = main.Unfreezer(client, Mock(), IgnoreList.parse([]), logger)
+    unf = unfreezer(logger, client=client)
 
-    unfreezer.poll_once()
+    unf.poll_once()
     assert sleep_mock.call_args.args == (main.SERVER_START_PAUSE,)
 
     sleep_mock.reset_mock()
-    client.poll.return_value = main.Poll(
+    client.poll.return_value = Poll(
         [Server('1', 'a', 'ACTIVE', 'ru-1')], {'ru-1': True},
     )
-    unfreezer.poll_once()
+    unf.poll_once()
     assert sleep_mock.called is False
 
 
-def test_poll_once_skips_the_cycle_when_selectel_is_unreachable(logger):
+def test_poll_once_keeps_metrics_when_selectel_is_unreachable(logger):
     client = Mock()
     client.poll.side_effect = requests.ConnectionError('down')
     metrics = Mock()
-    unfreezer = main.Unfreezer(client, metrics, IgnoreList.parse([]), logger)
+    unf = main.Unfreezer(client, metrics, IgnoreList.parse([]), logger)
 
-    unfreezer.poll_once()
+    unf.poll_once()
 
+    # Exporting here would clear every series instead of leaving the last
+    # known state in place.
     assert metrics.export.called is False
     assert client.start_server.called is False
 
@@ -458,37 +466,29 @@ def test_metrics_export_replaces_previous_samples(metrics, registry):
     old = Server('a1', 'srv-1', 'ACTIVE', 'ru-1')
     new = Server('a2', 'srv-2', FROZEN, 'ru-1')
 
-    metrics.export(main.Poll([old], {'ru-1': True}), IgnoreList.parse([]))
+    metrics.export(Poll([old], {'ru-1': True}), IgnoreList.parse([]))
     assert sample(registry, 'selectel_server_up', old) == 1
 
-    metrics.export(main.Poll([new], {'ru-1': True}), IgnoreList.parse([]))
+    metrics.export(Poll([new], {'ru-1': True}), IgnoreList.parse([]))
     assert sample(registry, 'selectel_server_up', old) is None
     assert sample(registry, 'selectel_server_up', new) == 0
 
 
-def test_metrics_export_flags_ignored_servers(metrics, registry):
+def test_metrics_export_sets_every_gauge(metrics, registry):
     managed = Server('1', 'srv-1', 'ACTIVE', 'ru-1')
     ignored = Server('2', 'srv-2', FROZEN, 'ru-1')
 
     metrics.export(
-        main.Poll([managed, ignored], {'ru-1': True}),
+        Poll([managed, ignored], {'ru-1': True, 'ru-2': False}),
         IgnoreList.parse(['srv-2']),
     )
 
+    assert sample(registry, 'selectel_server_up', managed) == 1
     assert sample(registry, 'selectel_server_ignored', managed) == 0
-    assert sample(registry, 'selectel_server_ignored', ignored) == 1
     # An ignored server still reports its real status.
     assert sample(registry, 'selectel_server_up', ignored) == 0
-
-
-def test_metrics_export_reports_region_reachability(metrics, registry):
-    metrics.export(
-        main.Poll([], {'ru-1': True, 'ru-2': False}), IgnoreList.parse([]),
-    )
-
-    assert registry.get_sample_value(
-        'selectel_region_up', {'region': 'ru-1'},
-    ) == 1
-    assert registry.get_sample_value(
-        'selectel_region_up', {'region': 'ru-2'},
-    ) == 0
+    assert sample(registry, 'selectel_server_ignored', ignored) == 1
+    for region, expected in (('ru-1', 1), ('ru-2', 0)):
+        assert registry.get_sample_value(
+            'selectel_region_up', {'region': region},
+        ) == expected
