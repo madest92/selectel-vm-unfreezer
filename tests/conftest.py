@@ -1,7 +1,7 @@
 import logging
 
 import pytest
-from prometheus_client import CollectorRegistry, Gauge
+from prometheus_client import CollectorRegistry
 
 import main
 
@@ -13,10 +13,15 @@ def logger():
 
 @pytest.fixture
 def client(logger):
-    return main.SelectelClient(
+    client = main.SelectelClient(
         account='acct', project='proj', user='usr', password='pwd',
-        regions=['ru-1', 'ru-2'], logger=logger,
+        logger=logger, regions=['ru-1', 'ru-2'],
     )
+    client._endpoints = {
+        'ru-1': 'https://ru-1.cloud.api.selcloud.ru/compute/v2.1',
+        'ru-2': 'https://ru-2.cloud.api.selcloud.ru/compute/v2.1',
+    }
+    return client
 
 
 @pytest.fixture
@@ -25,18 +30,5 @@ def registry():
 
 
 @pytest.fixture
-def gauge(registry):
-    return Gauge(
-        'selectel_server_up', 'test gauge',
-        ['server_name', 'server_id', 'region'],
-        registry=registry,
-    )
-
-
-@pytest.fixture
-def ignored_gauge(registry):
-    return Gauge(
-        'selectel_server_ignored', 'test gauge',
-        ['server_name', 'server_id', 'region'],
-        registry=registry,
-    )
+def metrics(registry):
+    return main.Metrics(registry)
