@@ -46,15 +46,14 @@ python main.py \
   --ignore-server staging-db
 ```
 
-Or via Docker, using the environment variables instead:
+Or via Docker, using the environment variables instead (a prebuilt image is published to `ghcr.io/madest92/selectel-vm-unfreezer`; use it instead of building locally):
 
 ```bash
-docker build -t selectel-vm-unfreezer .
 docker run -d -p 8000:8000 \
   -e SELECTEL_ACCOUNT=my-account -e SELECTEL_PROJECT=my-project \
   -e SELECTEL_USER=server-monitor -e SELECTEL_PASS=secret \
   -e SELECTEL_IGNORED_SERVERS=staging-db,test-vm \
-  selectel-vm-unfreezer
+  ghcr.io/madest92/selectel-vm-unfreezer:latest
 ```
 
 Full flag list: `python main.py --help`.
@@ -125,15 +124,14 @@ python main.py \
   --ignore-server staging-db
 ```
 
-Либо через Docker, используя переменные окружения:
+Либо через Docker, используя переменные окружения (готовый образ публикуется в `ghcr.io/madest92/selectel-vm-unfreezer`, собирать локально не нужно):
 
 ```bash
-docker build -t selectel-vm-unfreezer .
 docker run -d -p 8000:8000 \
   -e SELECTEL_ACCOUNT=my-account -e SELECTEL_PROJECT=my-project \
   -e SELECTEL_USER=server-monitor -e SELECTEL_PASS=secret \
   -e SELECTEL_IGNORED_SERVERS=staging-db,test-vm \
-  selectel-vm-unfreezer
+  ghcr.io/madest92/selectel-vm-unfreezer:latest
 ```
 
 Полный список параметров: `python main.py --help`.
